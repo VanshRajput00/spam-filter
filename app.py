@@ -1,11 +1,12 @@
 import streamlit as st
-import pandas as pd
-import math
-import re
+import os
 import time
+import re
+import math
+import dns.resolver
 from difflib import SequenceMatcher
-from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.naive_bayes import MultinomialNB
+import google.generativeai as genai
+from dotenv import load_dotenv
 
 # --- PAGE CONFIGURATION (Browser Tab) ---
 st.set_page_config(
@@ -100,6 +101,7 @@ def analyze_phone(number):
     clean_num = re.sub(r'\D', '', number) # Remove dashes/spaces
     
     # Check 1: Length (Too short or too long is suspicious)
+    # Standard mobile is 10-11 digits. 12+ without + prefix is weird.
     if len(clean_num) < 10 or len(clean_num) > 15:
         flags.append("Invalid Length (Number looks fake)")
         score += 30
@@ -110,10 +112,16 @@ def analyze_phone(number):
         score += 40
         
     # Check 3: Known VOIP/Spam Prefixes (Simple example)
-    bad_prefixes = ['999', '000', '123']
+    bad_prefixes = ['999', '000', '123', '889'] # 889 is often unassigned/scam
     if any(clean_num.startswith(p) for p in bad_prefixes):
-        flags.append("High-Risk Prefix detected")
-        score += 30
+        flags.append("High-Risk Prefix detected (VOIP/Unassigned)")
+        score += 50
+        
+    # Check 4: Unlikely Country Codes (if starts with valid-looking length)
+    # If it's 12 digits and starts with 88... likely scam check
+    if len(clean_num) == 12 and clean_num.startswith('88'):
+        flags.append("Suspicious International Format")
+        score += 40
 
     return score, flags
 
@@ -136,7 +144,7 @@ def analyze_email(email):
             flags.append(f"Impersonation Attempt (Looks like '{target}')")
             score += 50
 
-    # Check 2: Entropy (Randomness)
+    # Check 2: Entropy (Randomness) - Domain
     entropy = 0
     for x in range(256):
         p_x = float(name_part.count(chr(x)))/len(name_part)
@@ -146,44 +154,195 @@ def analyze_email(email):
         flags.append("Bot-Generated Domain (High Randomness)")
         score += 40
         
+    # Check 3: Username Analysis (New)
+    local_part = email.split('@')[0]
+    
+    # 3a. Username Entropy (Random gibberish like 'a8z9c2d3')
+    user_entropy = 0
+    for x in range(256):
+        p_x = float(local_part.count(chr(x)))/len(local_part)
+        if p_x > 0: user_entropy += - p_x*math.log(p_x, 2)
+        
+    if user_entropy > 4.2: # Slightly higher threshold for users
+        flags.append("Bot-Generated Username (High Randomness)")
+        score += 30
+        
+    # 3b. Unpronounceable (Too many consonants in a row)
+    # e.g. 'xgpvz'
+    if re.search(r'[bcdfghjklmnpqrstvwxyz]{5,}', local_part):
+        flags.append("Gibberish Username (Keyboard Smash)")
+        score += 35
+
     return score, flags
 
-# --- PART 2: AI BRAIN (Text Analysis) ---
-@st.cache_resource
-def load_model():
-    try:
-        try:
-            data = pd.read_csv('spam.csv', encoding='latin-1')
-        except:
-            data = pd.read_csv('spam.csv/spam.csv', encoding='latin-1')
-            
-        data = data.rename(columns={'v1': 'label', 'v2': 'message'})
+    return score, flags
+
+def analyze_email_heuristics(email):
+    """Hard-coded rules to catch obvious scams that AI might miss."""
+    flags = []
+    score = 0
+    email = email.lower()
+    
+    parts = email.split('@')
+    if len(parts) != 2:
+        return 50, ["Invalid Email Structure (Multiple '@' or missing)"]
         
-        # HOT PATCH: Injecting Modern Spam Data
-        new_spam = [
-            {'label': 'spam', 'message': 'congrats you have been shortlisted for placement in microsoft'},
-            {'label': 'spam', 'message': 'urgent verify your bank account identity'},
-            {'label': 'spam', 'message': 'click here to claim your lottery prize'},
-            {'label': 'spam', 'message': 'amazon delivery failed update payment details'},
-            {'label': 'spam', 'message': 'your account is compromised reset password'},
-            {'label': 'spam', 'message': 'remote job offer $500/day whatsapp now'},
-            {'label': 'spam', 'message': 'irs tax refund pending claim now'}
-        ]
-        data = pd.concat([data, pd.DataFrame(new_spam)], ignore_index=True)
+    local_part, domain_part = parts
+    
+    # --- DOMAIN & TLD ANALYSIS ---
+    # TLD (Top Level Domain) Check
+    tld = domain_part.split('.')[-1] if '.' in domain_part else ""
+    
+    # 1. Suspicious TLDs (Often used by cheap spammers)
+    suspicious_tlds = {'xyz', 'top', 'club', 'online', 'loan', 'win', 'bid', 'click', 'review', 'stream'}
+    if tld in suspicious_tlds:
+        flags.append(f"High-Risk TLD Detected (.{tld})")
+        score += 45
+        
+    # 2. Domain Numbers (e.g. gmail2.com, google55.in)
+    domain_name = domain_part.rsplit('.', 1)[0]
+    if re.search(r'\d', domain_name):
+        flags.append("Suspicious Number in Domain Name")
+        score += 50
+        
+    # 3. Multiple Hyphens in Domain
+    if domain_part.count('-') > 1: 
+        flags.append("Suspicious Domain Structure (Multiple Hyphens)")
+        score += 60
 
-        vectorizer = CountVectorizer(stop_words='english')
-        dtm = vectorizer.fit_transform(data['message'])
-        classifier = MultinomialNB()
-        classifier.fit(dtm, data['label'])
-        return vectorizer, classifier
-    except FileNotFoundError:
-        return None, None
+    # --- USERNAME ANALYSIS ---
+    # 4. Urgent/Status keywords in address
+    bad_words = ['verify', 'account', 'update', 'alert', 'security', 'support', 'team', 'service', 'confirm']
+    if any(w in email for w in bad_words):
+        flags.append("Generic/Impersonation Keywords detected")
+        score += 40
+        
+    # 5. Long numeric strings in username
+    # Relaxed Rule: Allow up to 6 digits (e.g. dates/years)
+    if len(re.findall(r'\d', local_part)) > 6:
+        flags.append("Bot-like Username (Many digits)")
+        score += 30
 
-vectorizer, classifier = load_model()
+    return score, flags
 
-if classifier is None:
-    st.error("⚠️ Database Error: 'spam.csv' not found.")
-    st.stop()
+def analyze_email_technical(email):
+    """Deep Technical Inspection: MX Records & Disposable Blocklist"""
+    flags = []
+    score = 0
+    domain = email.split('@')[-1].lower() if '@' in email else ""
+    
+    if not domain: return 0, []
+
+    # 1. DISPOSABLE DOMAIN CHECK
+    # Common temp mail providers
+    disposable_domains = {
+        'temp-mail.org', '10minutemail.com', 'guerrillamail.com', 'yopmail.com', 
+        'mailinator.com', 'discard.email', 'trashmail.com', 'maildrop.cc', 
+        'getnada.com', 'sharklasers.com', 'dispostable.com', 'owlymail.com'
+    }
+    
+    if domain in disposable_domains:
+        flags.append("Disposable/Burner Email Provider Detected")
+        score += 100 # Instant Ban
+        return score, flags
+
+    # 2. MX RECORD CHECK (Does the domain actually exist for email?)
+    try:
+        mx_records = dns.resolver.resolve(domain, 'MX')
+        # If we get here, it has records. Good.
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+        flags.append("Domain has NO MX Records (Cannot receive email)")
+        score += 80 # Very confusing/fake
+    except Exception:
+        pass # DNS timeout or other issues, ignore for now to avoid false positives
+
+    return score, flags
+
+# --- PART 2: AI BRAIN (Gemini API) ---
+
+def configure_gemini(api_key):
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        return model
+    except Exception as e:
+        return None
+
+def analyze_with_gemini(model, text):
+    """
+    Analyzes text using Google Gemini API for spam/phishing detection.
+    Returns: (is_spam, confidence, reasons)
+    """
+    if not model:
+        return False, 0, ["API Error: Model not initialized"]
+    
+    prompt = f"""
+    You are a heavily biased Spam Detection AI. Your ONLY GOAL is to catch phishing.
+    
+    Task: Classify this SENDER as 'Spam/Phishing' (true) or 'Safe' (false).
+    
+    EXAMPLES (Use these as a baseline):
+    - "889485684505" -> SPAM (Unknown Country Code, Suspicious Length)
+    - "+1234567890" -> SPAM (Invalid Sequence)
+    - "support-alert@company-security.com" -> SPAM (Hyphens, generic words)
+    - "verify@paypal-update.com" -> SPAM (Impersonation, non-official domain)
+    - "user123958@gmail.com" -> SPAM (Bot username)
+    - "john.doe@gmail.com" -> SAFE (Personal)
+    - "guleriaritesh29@gmail.com" -> SAFE (Personal, few digits)
+    - "no-reply@amazon.com" -> SAFE (Official Domain)
+    - "hr@microsoft.com" -> SAFE (Official Domain)
+    - "+15550199" -> SAFE (Standard Format)
+    
+    TARGET TO ANALYZE: "{text}"
+    
+    INSTRUCTIONS:
+    1. Phone Numbers: IF unassigned/suspicious country code (like +889...), MARK SPAM.
+    2. Domains: IF official provider (gmail.com, outlook.com, yahoo.com, icloud.com), BE LENIENT. Only flag if username is obviously bot-generated (e.g. 'x8237sdsd').
+    3. Domains: IF unknown/weird domain (e.g. 'verify-secure.net'), BE PARANOID.
+    4. Keywords: IF 'verify'/'safe' in domain, MARK SPAM.
+    
+    Return JSON:
+    {{
+        "is_spam": true/false,
+        "confidence": 100,
+        "reasons": ["Reason 1", "Reason 2"]
+    }}
+    """
+    
+    try:
+        response = model.generate_content(prompt, generation_config={"temperature": 0.1}) # Slight temp for nuance
+        # Clean up code blocks if Gemini returns them
+        cleaned_text = response.text.replace('```json', '').replace('```', '').strip()
+        import json
+        result = json.loads(cleaned_text)
+        return result.get('is_spam', False), result.get('confidence', 0), result.get('reasons', [])
+    except Exception as e:
+        return False, 0, [f"AI Analysis Failed: {str(e)}"]
+
+# --- API SETUP IN SIDEBAR ---
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    
+    # Try to load from env first
+    load_dotenv()
+    env_key = os.getenv("GEMINI_API_KEY")
+    
+    api_key = st.text_input(
+        "Enter Google Gemini API Key",
+        value=env_key if env_key else "",
+        type="password",
+        help="Get your free key from Google AI Studio"
+    )
+    
+    if not api_key:
+        st.warning("⚠️ API Key required for AI analysis")
+        model = None
+    else:
+        model = configure_gemini(api_key)
+        if model:
+            st.success("✅ AI System Online")
+        else:
+            st.error("❌ Invalid API Key")
 
 # --- PART 3: MAIN INTERFACE ---
 
@@ -197,9 +356,6 @@ with col_left:
     sender_type = st.radio("Source Type:", ["Email Address", "Phone Number"], horizontal=True, label_visibility="collapsed")
     sender_input = st.text_input(f"Sender ({sender_type}):", placeholder="e.g. +1 555-0102 or support@paypa1.com")
     
-    # Input 2: Message
-    message_input = st.text_area("Message Content:", height=150, placeholder="Paste the SMS or Email body here...")
-
 with col_right:
     st.markdown("### 🛡️ Live Diagnostics")
     st.info("""
@@ -215,39 +371,53 @@ with col_right:
 st.write("---")
 if st.button("RUN SECURITY SCAN", type="primary", use_container_width=True):
     
-    if not sender_input and not message_input:
-        st.warning("Please enter data to scan.")
+    if not sender_input:
+        st.warning("Please enter a sender to scan.")
     else:
         with st.spinner("Triangulating Threat Vectors..."):
             time.sleep(1.2) # Simulate processing
             
-            # 1. ANALYZE SENDER
+            # 1. ANALYZE SENDER (Heuristics)
             sender_score = 0
             sender_flags = []
             
             if "@" in sender_input: # It's an Email
-                sender_score, sender_flags = analyze_email(sender_input)
+                # Run Regex/Typosquatting Check
+                s1, f1 = analyze_email(sender_input)
+                # Run New Static Rules Check
+                s2, f2 = analyze_email_heuristics(sender_input)
+                # Run Technical Check (MX + Disposable)
+                s3, f3 = analyze_email_technical(sender_input)
+                
+                sender_score = s1 + s2 + s3
+                sender_flags = f1 + f2 + f3
+                
             elif any(char.isdigit() for char in sender_input): # It's a Phone
                 sender_score, sender_flags = analyze_phone(sender_input)
                 
-            # 2. ANALYZE TEXT (AI)
-            full_text = f"{sender_input} {message_input}"
-            vector = vectorizer.transform([full_text])
-            prediction = classifier.predict(vector)[0]
-            proba = classifier.predict_proba(vector)
-            ai_confidence = max(proba[0]) * 100
+            # 2. ANALYZE SENDER (AI)
+            full_text = f"{sender_input}"
+            
+            is_spam_ai = False
+            ai_confidence = 0
+            ai_reasons = []
+            
+            if model:
+                is_spam_ai, ai_confidence, ai_reasons = analyze_with_gemini(model, full_text)
+            else:
+                ai_reasons = ["AI Analysis skipped (No API Key)"]
             
             # 3. FINAL VERDICT CALCULATION
-            # If (Sender is Bad) OR (AI says Spam) -> High Risk
+            # If (Heuristics > 0) OR (AI says Spam) -> High Risk
             is_spam = False
             risk_reasons = []
             
             # Gather Reasons
-            if prediction == 'spam':
+            if is_spam_ai:
                 is_spam = True
-                risk_reasons.append("AI detected spam linguistic patterns (Urgency/Financial keywords)")
+                risk_reasons.extend(ai_reasons)
             
-            if sender_score > 0:
+            if sender_score > 20: # Lowered threshold for strictness
                 is_spam = True
                 risk_reasons.extend(sender_flags)
             
